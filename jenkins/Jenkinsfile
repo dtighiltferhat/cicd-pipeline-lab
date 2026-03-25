@@ -1,0 +1,161 @@
+// jenkins/Jenkinsfile
+// Declarative Jenkins pipeline: Checkout → Build → Test → Docker → Push → Deploy
+
+pipeline {
+    agent any
+
+    environment {
+        APP_NAME        = 'sample-app'
+        DOCKER_REGISTRY = 'dtighiltferhat'
+        IMAGE_TAG       = "${env.GIT_COMMIT[0..7]}"
+        FULL_IMAGE      = "${DOCKER_REGISTRY}/${APP_NAME}:${IMAGE_TAG}"
+        S3_BUCKET       = 'dtf-cicd-artifacts'
+        AWS_REGION      = 'us-east-1'
+    }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        timeout(time: 30, unit: 'MINUTES')
+        disableConcurrentBuilds()
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                echo "Checking out branch: ${env.BRANCH_NAME}"
+                checkout scm
+                sh 'git log -1 --oneline'
+            }
+        }
+
+        stage('Install Dependencies') {
+            steps {
+                sh '''
+                    python3 -m venv venv
+                    . venv/bin/activate
+                    pip install --upgrade pip
+                    pip install -r app/requirements.txt
+                '''
+            }
+        }
+
+        stage('Lint') {
+            steps {
+                sh '''
+                    . venv/bin/activate
+                    flake8 app/src/ --max-line-length=120
+                '''
+            }
+        }
+
+        stage('Unit Tests') {
+            steps {
+                sh '''
+                    . venv/bin/activate
+                    pytest app/tests/unit/ -v --junitxml=reports/unit-tests.xml
+                '''
+            }
+            post {
+                always {
+                    junit 'reports/unit-tests.xml'
+                }
+            }
+        }
+
+        stage('Integration Tests') {
+            steps {
+                sh '''
+                    . venv/bin/activate
+                    pytest app/tests/integration/ -v --junitxml=reports/integration-tests.xml
+                '''
+            }
+            post {
+                always {
+                    junit 'reports/integration-tests.xml'
+                }
+                failure {
+                    error "Integration tests failed — deployment blocked"
+                }
+            }
+        }
+
+        stage('Docker Build') {
+            steps {
+                echo "Building Docker image: ${FULL_IMAGE}"
+                sh "docker build -f docker/Dockerfile -t ${FULL_IMAGE} -t ${DOCKER_REGISTRY}/${APP_NAME}:latest ."
+            }
+        }
+
+        stage('Docker Push') {
+            steps {
+                withCredentials([usernamePassword(
+                    credentialsId: 'dockerhub-credentials',
+                    usernameVariable: 'DOCKER_USER',
+                    passwordVariable: 'DOCKER_PASS'
+                )]) {
+                    sh '''
+                        echo "$DOCKER_PASS" | docker login -u "$DOCKER_USER" --password-stdin
+                        docker push ${FULL_IMAGE}
+                        docker push ${DOCKER_REGISTRY}/${APP_NAME}:latest
+                        docker logout
+                    '''
+                }
+            }
+        }
+
+        stage('Upload Artifact to S3') {
+            steps {
+                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding',
+                    credentialsId: 'aws-credentials']]) {
+                    sh '''
+                        echo "${IMAGE_TAG}" > build-manifest.txt
+                        echo "${APP_NAME}" >> build-manifest.txt
+                        echo "${BUILD_NUMBER}" >> build-manifest.txt
+                        aws s3 cp build-manifest.txt \
+                            s3://${S3_BUCKET}/builds/${APP_NAME}/${IMAGE_TAG}/build-manifest.txt \
+                            --region ${AWS_REGION}
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy') {
+            when {
+                branch 'main'
+            }
+            steps {
+                sh '''
+                    chmod +x scripts/deploy.sh
+                    ./scripts/deploy.sh ${IMAGE_TAG}
+                '''
+            }
+        }
+
+        stage('Smoke Test') {
+            when {
+                branch 'main'
+            }
+            steps {
+                sh '''
+                    sleep 10
+                    . venv/bin/activate
+                    pytest app/tests/smoke/ -v
+                '''
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "Pipeline SUCCESS — Image: ${FULL_IMAGE}"
+        }
+        failure {
+            echo "Pipeline FAILED — check logs above"
+        }
+        always {
+            sh 'docker rmi ${FULL_IMAGE} || true'
+            cleanWs()
+        }
+    }
+}
